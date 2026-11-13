@@ -1,24 +1,28 @@
-# -*- coding: utf-8 -*-
 """
 This file contains all jobs that are used in tests.  Each of these test
-fixtures has a slighty different characteristics.
+fixtures has a slightly different characteristics.
 """
-from __future__ import (absolute_import, division, print_function,
-                        unicode_literals)
 
+from __future__ import annotations
+
+import asyncio
 import os
-import time
 import signal
-import sys
 import subprocess
-import contextlib
+import sys
+import time
 from multiprocessing import Process
 
 from redis import Redis
-from rq import Connection, get_current_job, get_current_connection, Queue
-from rq.decorators import job
-from rq.compat import text_type
-from rq.worker import HerokuWorker, Worker
+
+from rq import Queue, get_current_job
+from rq.command import send_kill_horse_command, send_shutdown_command
+from rq.connections import get_connection_kwargs
+from rq.defaults import DEFAULT_JOB_MONITORING_INTERVAL
+from rq.job import Job
+from rq.suspension import resume
+from rq.timeouts import UnixSignalDeathPenalty
+from rq.worker import HerokuWorker, SpawnWorker, Worker
 
 
 def say_pid():
@@ -29,7 +33,7 @@ def say_hello(name=None):
     """A job with a single argument and a return value."""
     if name is None:
         name = 'Stranger'
-    return 'Hi there, %s!' % (name,)
+    return f'Hi there, {name}!'
 
 
 async def say_hello_async(name=None):
@@ -37,9 +41,45 @@ async def say_hello_async(name=None):
     return say_hello(name)
 
 
+async def record_job_loop(state, error=None):
+    """Record the coroutine job's loop and context, optionally raising an error."""
+    state['loop'] = asyncio.get_running_loop()
+    state['job'] = get_current_job()
+    if error is not None:
+        raise error
+    return 42
+
+
+async def leave_async_resources(state):
+    """Leave a pending task and an asynchronous generator for the job to finalize."""
+    state['loop'] = asyncio.get_running_loop()
+    started = asyncio.Event()
+
+    async def background():
+        try:
+            started.set()
+            await asyncio.Event().wait()
+        finally:
+            await asyncio.sleep(0)
+            state['task_closed'] = True
+
+    async def generate():
+        try:
+            yield 1
+        finally:
+            await asyncio.sleep(0)
+            state['generator_closed'] = True
+
+    state['task'] = asyncio.create_task(background())
+    state['generator'] = generate()
+    await state['generator'].__anext__()
+    await started.wait()
+    return 42
+
+
 def say_hello_unicode(name=None):
     """A job with a single argument and a return value."""
-    return text_type(say_hello(name))  # noqa
+    return str(say_hello(name))  # noqa
 
 
 def do_nothing():
@@ -47,7 +87,7 @@ def do_nothing():
     pass
 
 
-def raise_exc():
+def raise_exc(*args, **kwargs):
     raise Exception('raise_exc error')
 
 
@@ -60,6 +100,33 @@ def div_by_zero(x):
     return x / 0
 
 
+def fail_while_retries_remain():
+    """Raises while retries remain, succeeds on the final attempt."""
+    job = get_current_job()
+    if job.retries_left and job.retries_left > 0:
+        raise Exception('failing while retries remain')
+    return 'success'
+
+
+def returns_retry():
+    """Always returns a Retry object (return-based retry)."""
+    from rq import Retry
+
+    return Retry(max=1)
+
+
+def returns_retry_with_delay():
+    """Always returns a delayed Retry object (return-based retry)."""
+    from rq import Retry
+
+    return Retry(max=1, interval=30)
+
+
+def long_process():
+    time.sleep(60)
+    return
+
+
 def some_calculation(x, y, z=1):
     """Some arbitrary calculation with three numbers.  Choose z smartly if you
     want a division by zero exception.
@@ -67,14 +134,14 @@ def some_calculation(x, y, z=1):
     return x * y / z
 
 
-def rpush(key, value, append_worker_name=False, sleep=0):
+def rpush(key, value, connection_kwargs: dict, append_worker_name=False, sleep=0):
     """Push a value into a list in Redis. Useful for detecting the order in
     which jobs were executed."""
     if sleep:
         time.sleep(sleep)
     if append_worker_name:
         value += ':' + get_current_job().worker_name
-    redis = get_current_connection()
+    redis = Redis(**connection_kwargs)
     redis.rpush(key, value)
 
 
@@ -94,20 +161,19 @@ def create_file_after_timeout(path, timeout):
     create_file(path)
 
 
-def create_file_after_timeout_and_setsid(path, timeout):
-    os.setsid()
+def create_file_after_timeout_and_setpgrp(path, timeout):
+    os.setpgrp()
     create_file_after_timeout(path, timeout)
 
 
 def launch_process_within_worker_and_store_pid(path, timeout):
     p = subprocess.Popen(['sleep', str(timeout)])
     with open(path, 'w') as f:
-        f.write('{}'.format(p.pid))
+        f.write(f'{p.pid}')
     p.wait()
 
 
 def access_self():
-    assert get_current_connection() is not None
     assert get_current_job() is not None
 
 
@@ -142,24 +208,18 @@ class Number:
 
 class CallableObject:
     def __call__(self):
-        return u"I'm callable"
+        return "I'm callable"
 
 
 class UnicodeStringObject:
     def __repr__(self):
-        return u'é'
+        return 'é'
 
 
-class ClassWithAStaticMethod(object):
+class ClassWithAStaticMethod:
     @staticmethod
     def static_method():
-        return u"I'm a static method"
-
-
-with Connection():
-    @job(queue='default')
-    def decorated_job(x, y):
-        return x + y
+        return "I'm a static method"
 
 
 def black_hole(job, *exc_info):
@@ -181,12 +241,16 @@ def save_key_ttl(key):
     job.save_meta()
 
 
-def long_running_job(timeout=10):
+def long_running_job(timeout=10, horse_pid_key=None):
+    job = get_current_job()
+    if horse_pid_key:
+        # Store the PID of the worker horse in a key
+        job.connection.set(horse_pid_key, os.getpid(), ex=60)
     time.sleep(timeout)
     return 'Done sleeping...'
 
 
-def run_dummy_heroku_worker(sandbox, _imminent_shutdown_delay):
+def run_dummy_heroku_worker(sandbox, _imminent_shutdown_delay, connection):
     """
     Run the work horse for a simplified heroku worker where perform_job just
     creates two sentinel files 2 seconds apart.
@@ -198,23 +262,39 @@ def run_dummy_heroku_worker(sandbox, _imminent_shutdown_delay):
     class TestHerokuWorker(HerokuWorker):
         imminent_shutdown_delay = _imminent_shutdown_delay
 
-        def perform_job(self, job, queue):
+        def perform_job(self, job, queue, execution=None):
             create_file(os.path.join(sandbox, 'started'))
             # have to loop here rather than one sleep to avoid holding the GIL
             # and preventing signals being received
             for i in range(20):
                 time.sleep(0.1)
             create_file(os.path.join(sandbox, 'finished'))
+            return True
 
-    w = TestHerokuWorker(Queue('dummy'))
-    w.main_work_horse(None, None)
+    w = TestHerokuWorker(Queue('dummy', connection=connection), connection=connection)
+    w.main_work_horse(None, None)  # type: ignore[no-untyped-call]
 
 
 class DummyQueue:
     pass
 
 
-def kill_worker(pid, double_kill, interval=0.5):
+def kill_horse(horse_pid_key: str, connection_kwargs: dict, interval: float = 1.5):
+    """
+    Kill the worker horse process by its PID stored in a Redis key.
+    :param horse_pid_key: Redis key where the horse PID is stored
+    :param connection_kwargs: Connection parameters for Redis
+    :param interval: Time to wait before sending the kill signal
+    """
+    time.sleep(interval)
+    redis = Redis(**connection_kwargs)
+    value = redis.get(horse_pid_key)
+    if value:
+        pid = int(value)
+        os.kill(pid, signal.SIGKILL)
+
+
+def kill_worker(pid: int, double_kill: bool, interval: float = 1.5):
     # wait for the worker to be started over on the main process
     time.sleep(interval)
     os.kill(pid, signal.SIGTERM)
@@ -224,41 +304,57 @@ def kill_worker(pid, double_kill, interval=0.5):
         os.kill(pid, signal.SIGTERM)
 
 
+def resume_worker(connection_kwargs: dict, interval: float = 1):
+    # Wait and resume RQ
+    time.sleep(interval)
+    resume(Redis(**connection_kwargs))
+
+
 class Serializer:
-    def loads(self): pass
+    def loads(self):
+        pass
 
-    def dumps(self): pass
+    def dumps(self):
+        pass
 
 
-def start_worker(queue_name, conn_kwargs, worker_name, burst):
+def start_worker(queue_name, conn_kwargs, worker_name, burst, job_monitoring_interval=None):
     """
     Start a worker. We accept only serializable args, so that this can be
     executed via multiprocessing.
     """
     # Silence stdout (thanks to <https://stackoverflow.com/a/28321717/14153673>)
-    with open(os.devnull, 'w') as devnull:
-        with contextlib.redirect_stdout(devnull):
-            w = Worker([queue_name], name=worker_name, connection=Redis(**conn_kwargs))
-            w.work(burst=burst)
+    # with open(os.devnull, 'w') as devnull:
+    #     with contextlib.redirect_stdout(devnull):
+    w = Worker(
+        [queue_name],
+        name=worker_name,
+        connection=Redis(**conn_kwargs),
+        job_monitoring_interval=job_monitoring_interval or DEFAULT_JOB_MONITORING_INTERVAL,
+    )
+    w.work(burst=burst)
 
-def start_worker_process(queue_name, connection=None, worker_name=None, burst=False):
+
+def start_worker_process(
+    queue_name, connection, worker_name=None, burst=False, job_monitoring_interval: int | None = None
+) -> Process:
     """
     Use multiprocessing to start a new worker in a separate process.
     """
-    connection = connection or get_current_connection()
-    conn_kwargs = connection.connection_pool.connection_kwargs
-    p = Process(target=start_worker, args=(queue_name, conn_kwargs, worker_name, burst))
+    conn_kwargs = get_connection_kwargs(connection)
+    p = Process(target=start_worker, args=(queue_name, conn_kwargs, worker_name, burst, job_monitoring_interval))
     p.start()
     return p
 
-def burst_two_workers(queue, timeout=2, tries=5, pause=0.1):
+
+def burst_two_workers(queue, connection: Redis, timeout=2, tries=5, pause=0.1):
     """
     Get two workers working simultaneously in burst mode, on a given queue.
     Return after both workers have finished handling jobs, up to a fixed timeout
     on the worker that runs in another process.
     """
-    w1 = start_worker_process(queue.name, worker_name='w1', burst=True)
-    w2 = Worker(queue, name='w2')
+    w1 = start_worker_process(queue.name, worker_name='w1', burst=True, connection=connection)
+    w2 = Worker(queue, name='w2', connection=connection)
     jobs = queue.jobs
     if jobs:
         first_job = jobs[0]
@@ -275,14 +371,80 @@ def burst_two_workers(queue, timeout=2, tries=5, pause=0.1):
 
 def save_result(job, connection, result):
     """Store job result in a key"""
-    connection.set('success_callback:%s' % job.id, result, ex=60)
+    connection.set(f'success_callback:{job.id}', result, ex=60)
 
 
 def save_exception(job, connection, type, value, traceback):
     """Store job exception in a key"""
-    connection.set('failure_callback:%s' % job.id, str(value), ex=60)
+    connection.set(f'failure_callback:{job.id}', str(value), ex=60)
+
+
+def save_result_if_not_stopped(job, connection, result=''):
+    connection.set(f'stopped_callback:{job.id}', result, ex=60)
+
+
+def save_status_on_success(job, connection, result):
+    """Store job status during success callback to verify it's updated."""
+    connection.set(f'success_callback_status:{job.id}', job.get_status(refresh=False).value, ex=60)
+
+
+def save_status_on_failure(job, connection, type, value, traceback):
+    """Store job status during failure callback to verify it's updated."""
+    connection.set(f'failure_callback_status:{job.id}', job.get_status(refresh=False).value, ex=60)
 
 
 def erroneous_callback(job):
     """A callback that's not written properly"""
     pass
+
+
+def _send_shutdown_command(worker_name, connection_kwargs, delay=0.25):
+    time.sleep(delay)
+    send_shutdown_command(Redis(**connection_kwargs), worker_name)
+
+
+def _send_kill_horse_command(worker_name, connection_kwargs, delay=0.25):
+    """Waits delay before sending kill-horse command"""
+    time.sleep(delay)
+    send_kill_horse_command(Redis(**connection_kwargs), worker_name)
+
+
+class CustomJob(Job):
+    """A custom job class just to test it"""
+
+
+class CustomQueue(Queue):
+    """A custom queue class just to test it, with its own key prefix"""
+
+    redis_queue_namespace_prefix = 'custom:queue:'
+
+
+class CustomDeathPenalty(UnixSignalDeathPenalty):
+    """A custom death penalty class just to test it"""
+
+
+def get_job_id_from_environ():
+    return os.environ['RQ_JOB_ID']
+
+
+class RecordingSpawnWorker(SpawnWorker):
+    """Records, from inside the horse, the classes it runs the job with."""
+
+    def perform_job(self, job, queue, execution):
+        self.connection.set(
+            'spawn-worker-config',
+            f'{type(self).__name__} {type(job).__name__} {type(queue).__name__} {self.death_penalty_class.__name__}',
+        )
+        return super().perform_job(job, queue, execution)
+
+
+async def async_success_callback(job, connection, result):
+    connection.set(f'async_success_callback:{job.id}', result, ex=60)
+
+
+async def async_failure_callback(job, connection, type, value, traceback):
+    connection.set(f'async_failure_callback:{job.id}', str(value), ex=60)
+
+
+async def async_stopped_callback(job, connection):
+    connection.set(f'async_stopped_callback:{job.id}', 'stopped', ex=60)

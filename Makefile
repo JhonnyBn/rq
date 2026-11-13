@@ -4,6 +4,9 @@ all:
 clean:
 	rm -rf build/ dist/
 
+test:
+	docker build -f tests/Dockerfile . -t rqtest && docker run -it --rm rqtest
+
 release: clean
 	# Check if latest tag is the current head we're releasing
 	echo "Latest tag = $$(git tag | sort -nr | head -n1)"
@@ -16,3 +19,6 @@ force_release: clean
 	git push --tags
 	python setup.py sdist bdist_wheel
 	twine upload dist/*
+
+lint:
+	@ ruff check --output-format=full rq tests

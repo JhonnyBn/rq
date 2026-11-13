@@ -45,7 +45,7 @@ Whenever a dequeue is requested, an RQ worker does two things:
 * It starts executing the function call.
 * If the job succeeds, its return value is written to the `result` hash key and
   the hash itself is expired after 500 seconds; or
-* If the job failes, the exception information is written to the `exc_info`
+* If the job fails, the exception information is written to the `exc_info`
   hash key and the job ID is pushed onto the `failed` queue.
 
 
@@ -55,8 +55,10 @@ Any job ID that is encountered by a worker for which no job hash is found in
 Redis is simply ignored.  This makes it easy to cancel jobs by simply removing
 the job hash.  In Python:
 
+```python
     from rq import cancel_job
     cancel_job('2eafc1e6-48c2-464b-a0ff-88fd199d039c')
+```
 
 Note that it is irrelevant on which queue the job resides.  When a worker
 eventually pops the job ID from the queue and notes that the Job hash does not

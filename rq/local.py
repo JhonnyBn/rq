@@ -1,27 +1,21 @@
-# -*- coding: utf-8 -*-
-# flake8: noqa
+# ruff: noqa: E731
 """
-    werkzeug.local
-    ~~~~~~~~~~~~~~
+werkzeug.local
+~~~~~~~~~~~~~~
 
-    This module implements context-local objects.
+This module implements context-local objects.
 
-    :copyright: (c) 2011 by the Werkzeug Team, see AUTHORS for more details.
-    :license: BSD, see LICENSE for more details.
+:copyright: (c) 2011 by the Werkzeug Team, see AUTHORS for more details.
+:license: BSD, see LICENSE for more details.
 """
+
 # Since each thread has its own greenlet we can just use those as identifiers
 # for the context.  If greenlets are not available we fall back to the
 # current thread ident.
 try:
     from greenlet import getcurrent as get_ident
-except ImportError:  # noqa
-    try:
-        from thread import get_ident  # noqa
-    except ImportError:  # noqa
-        try:
-            from _thread import get_ident  # noqa
-        except ImportError:  # noqa
-            from dummy_thread import get_ident  # noqa
+except ImportError:
+    from threading import get_ident  # type: ignore[assignment]
 
 
 def release_local(local):
@@ -121,8 +115,9 @@ class LocalStack:
     def _get__ident_func__(self):
         return self._local.__ident_func__
 
-    def _set__ident_func__(self, value):  # noqa
+    def _set__ident_func__(self, value):
         object.__setattr__(self._local, '__ident_func__', value)
+
     __ident_func__ = property(_get__ident_func__, _set__ident_func__)
     del _get__ident_func__, _set__ident_func__
 
@@ -132,6 +127,7 @@ class LocalStack:
             if rv is None:
                 raise RuntimeError('object unbound')
             return rv
+
         return LocalProxy(_lookup)
 
     def push(self, obj):
@@ -175,8 +171,8 @@ class LocalStack:
 class LocalManager:
     """Local objects cannot manage themselves. For that you need a local
     manager.  You can pass a local manager multiple locals or add them later
-    by appending them to `manager.locals`.  Everytime the manager cleans up
-    it, will clean up all the data left in the locals for this context.
+    by appending them to `manager.locals`.  Every time the manager cleans
+    up, it will clean up all the data left in the locals for this context.
 
     The `ident_func` parameter can be added to override the default ident
     function for the wrapped locals.
@@ -224,10 +220,7 @@ class LocalManager:
             release_local(local)
 
     def __repr__(self):
-        return '<%s storages: %d>' % (
-            self.__class__.__name__,
-            len(self.locals)
-        )
+        return f'<{self.__class__.__name__} storages: {len(self.locals)}>'
 
 
 class LocalProxy:
@@ -263,8 +256,9 @@ class LocalProxy:
         session = LocalProxy(lambda: get_current_request().session)
 
     .. versionchanged:: 0.6.1
-       The class can be instanciated with a callable as well now.
+       The class can be instantiated with a callable as well now.
     """
+
     __slots__ = ('__local', '__dict__', '__name__')
 
     def __init__(self, local, name=None):
@@ -281,7 +275,7 @@ class LocalProxy:
         try:
             return getattr(self.__local, self.__name__)
         except AttributeError:
-            raise RuntimeError('no object bound to %s' % self.__name__)
+            raise RuntimeError(f'no object bound to {self.__name__}')
 
     @property
     def __dict__(self):
@@ -294,20 +288,8 @@ class LocalProxy:
         try:
             obj = self._get_current_object()
         except RuntimeError:
-            return '<%s unbound>' % self.__class__.__name__
+            return f'<{self.__class__.__name__} unbound>'
         return repr(obj)
-
-    def __nonzero__(self):
-        try:
-            return bool(self._get_current_object())
-        except RuntimeError:
-            return False
-
-    def __unicode__(self):
-        try:
-            return unicode(self._get_current_object())
-        except RuntimeError:
-            return repr(self)
 
     def __dir__(self):
         try:
@@ -326,54 +308,125 @@ class LocalProxy:
     def __delitem__(self, key):
         del self._get_current_object()[key]
 
-    def __setslice__(self, i, j, seq):
-        self._get_current_object()[i:j] = seq
+    def __setattr__(self, name, value):
+        setattr(self._get_current_object(), name, value)
 
-    def __delslice__(self, i, j):
-        del self._get_current_object()[i:j]
+    def __delattr__(self, name):
+        return delattr(self._get_current_object(), name)
 
-    __setattr__ = lambda x, n, v: setattr(x._get_current_object(), n, v)
-    __delattr__ = lambda x, n: delattr(x._get_current_object(), n)
-    __str__ = lambda x: str(x._get_current_object())
-    __lt__ = lambda x, o: x._get_current_object() < o
-    __le__ = lambda x, o: x._get_current_object() <= o
-    __eq__ = lambda x, o: x._get_current_object() == o
-    __ne__ = lambda x, o: x._get_current_object() != o
-    __gt__ = lambda x, o: x._get_current_object() > o
-    __ge__ = lambda x, o: x._get_current_object() >= o
-    __cmp__ = lambda x, o: cmp(x._get_current_object(), o)
-    __hash__ = lambda x: hash(x._get_current_object())
-    __call__ = lambda x, *a, **kw: x._get_current_object()(*a, **kw)
-    __len__ = lambda x: len(x._get_current_object())
-    __getitem__ = lambda x, i: x._get_current_object()[i]
-    __iter__ = lambda x: iter(x._get_current_object())
-    __contains__ = lambda x, i: i in x._get_current_object()
-    __getslice__ = lambda x, i, j: x._get_current_object()[i:j]
-    __add__ = lambda x, o: x._get_current_object() + o
-    __sub__ = lambda x, o: x._get_current_object() - o
-    __mul__ = lambda x, o: x._get_current_object() * o
-    __floordiv__ = lambda x, o: x._get_current_object() // o
-    __mod__ = lambda x, o: x._get_current_object() % o
-    __divmod__ = lambda x, o: x._get_current_object().__divmod__(o)
-    __pow__ = lambda x, o: x._get_current_object() ** o
-    __lshift__ = lambda x, o: x._get_current_object() << o
-    __rshift__ = lambda x, o: x._get_current_object() >> o
-    __and__ = lambda x, o: x._get_current_object() & o
-    __xor__ = lambda x, o: x._get_current_object() ^ o
-    __or__ = lambda x, o: x._get_current_object() | o
-    __div__ = lambda x, o: x._get_current_object().__div__(o)
-    __truediv__ = lambda x, o: x._get_current_object().__truediv__(o)
-    __neg__ = lambda x: -(x._get_current_object())
-    __pos__ = lambda x: +(x._get_current_object())
-    __abs__ = lambda x: abs(x._get_current_object())
-    __invert__ = lambda x: ~(x._get_current_object())
-    __complex__ = lambda x: complex(x._get_current_object())
-    __int__ = lambda x: int(x._get_current_object())
-    __long__ = lambda x: long(x._get_current_object())
-    __float__ = lambda x: float(x._get_current_object())
-    __oct__ = lambda x: oct(x._get_current_object())
-    __hex__ = lambda x: hex(x._get_current_object())
-    __index__ = lambda x: x._get_current_object().__index__()
-    __coerce__ = lambda x, o: x._get_current_object().__coerce__(x, o)
-    __enter__ = lambda x: x._get_current_object().__enter__()
-    __exit__ = lambda x, *a, **kw: x._get_current_object().__exit__(*a, **kw)
+    def __str__(self):
+        return str(self._get_current_object())
+
+    def __lt__(self, other):
+        return self._get_current_object() < other
+
+    def __le__(self, other):
+        return self._get_current_object() <= other
+
+    def __eq__(self, other):
+        return self._get_current_object() == other
+
+    def __ne__(self, other):
+        return self._get_current_object() != other
+
+    def __gt__(self, other):
+        return self._get_current_object() > other
+
+    def __ge__(self, other):
+        return self._get_current_object() >= other
+
+    def __hash__(self):
+        return hash(self._get_current_object())
+
+    def __call__(self, *args, **kwargs):
+        return self._get_current_object()(*args, **kwargs)
+
+    def __len__(self):
+        return len(self._get_current_object())
+
+    def __getitem__(self, i):
+        return self._get_current_object()[i]
+
+    def __iter__(self):
+        return iter(self._get_current_object())
+
+    def __contains__(self, obj):
+        return obj in self._get_current_object()
+
+    def __add__(self, other):
+        return self._get_current_object() + other
+
+    def __sub__(self, other):
+        return self._get_current_object() - other
+
+    def __mul__(self, other):
+        return self._get_current_object() * other
+
+    def __floordiv__(self, other):
+        return self._get_current_object() // other
+
+    def __mod__(self, other):
+        return self._get_current_object() % other
+
+    def __divmod__(self, other):
+        return self._get_current_object().__divmod__(other)
+
+    def __pow__(self, other):
+        return self._get_current_object() ** other
+
+    def __lshift__(self, other):
+        return self._get_current_object() << other
+
+    def __rshift__(self, other):
+        return self._get_current_object() >> other
+
+    def __and__(self, other):
+        return self._get_current_object() & other
+
+    def __xor__(self, other):
+        return self._get_current_object() ^ other
+
+    def __or__(self, other):
+        return self._get_current_object() | other
+
+    def __div__(self, other):
+        return self._get_current_object().__div__(other)
+
+    def __truediv__(self, other):
+        return self._get_current_object().__truediv__(other)
+
+    def __neg__(self):
+        return -(self._get_current_object())
+
+    def __pos__(self):
+        return +(self._get_current_object())
+
+    def __abs__(self):
+        return abs(self._get_current_object())
+
+    def __invert__(self):
+        return ~(self._get_current_object())
+
+    def __complex__(self):
+        return complex(self._get_current_object())
+
+    def __int__(self):
+        return int(self._get_current_object())
+
+    def __float__(self):
+        return float(self._get_current_object())
+
+    def __oct__(self):
+        return oct(self._get_current_object())
+
+    def __hex__(self):
+        return hex(self._get_current_object())
+
+    def __index__(self):
+        return self._get_current_object().__index__()
+
+    def __enter__(self):
+        return self._get_current_object().__enter__()
+
+    def __exit__(self, *args, **kwargs):
+        return self._get_current_object().__exit__(*args, **kwargs)

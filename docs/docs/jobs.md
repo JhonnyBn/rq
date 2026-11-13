@@ -10,6 +10,37 @@ jobs.
 
 ## RQ's Job Object
 
+### The Job Lifecycle
+
+The life-cycle of a worker consists of a few phases:
+
+1. _Queued_. When `queue.enqueue(foo)` is called, a `Job` will be created and it's ID
+pushed into the queue. `job.get_status()` will return `queued`.
+2. _Started_. When a worker picks up a job from queue, the job status will be set to `started`.
+In this phase an `Execution` object will be created and it's `composite_key` put in `StartedJobRegistry`.
+3. _Finished_. After an execution has ended, `execution` will be removed from `StartedJobRegistry`.
+A `Result` object that holds the result of the execution will be created. Both the `Job` and `Result` key
+will persist in Redis until the value of `result_ttl` is up. More details [here](/docs/results/).
+
+
+#### Job Status
+
+The status of a job can be one of the following:
+
+* `queued`: The default status for created jobs, except for those that have dependencies, which will be created as `deferred`. These jobs have been placed in a queue and are ready to be executed.
+* `finished`: The job has finished execution and is available through the finished job registry.
+* `failed`: Jobs that encountered errors during execution or expired before being executed.
+* `started`: The job has started execution. This status includes the job execution support mechanisms, such as setting the worker name and setting up heartbeat information.
+* `deferred`: The job is not ready for execution because its dependencies have not finished successfully yet.
+* `rate_limited`: The job is waiting for capacity under a concurrency rate limit. It exists in Redis but is not placed on a queue or included in queue counts until capacity becomes available.
+* `ready_to_enqueue`: An internal, transient status for a job whose dependencies have completed and that is about to be enqueued. Jobs pass through it briefly during dependency resolution and crash recovery; it is not user-actionable.
+* `scheduled`: Jobs created to run at a future date or jobs that are retried after a retry interval.
+* `stopped`: The job was stopped because the worker was stopped.
+* `canceled`: The job has been manually canceled and will not be executed, even if it is part of a dependency chain.
+
+These statuses can also be accessed from the job object using boolean properties, such as `job.is_finished`.
+
+
 ### Job Creation
 
 When you enqueue a function, a job will be returned.  You may then access the
@@ -29,6 +60,7 @@ print('Job id: %s' % job.id)
 ```
 
 Or if you want a predetermined job id, you may specify it when creating the job.
+Custom job ids may contain only letters, numbers, underscores and dashes.
 
 ```python
 job = q.enqueue(count_words_at_url, 'http://nvie.com', job_id='my_job_id')
@@ -84,7 +116,7 @@ job = Job.create(count_words_at_url,
           })
 ```
 
-### Retrieving a Job from Redis
+### Retrieving Jobs
 
 All job information is stored in Redis. You can inspect a job and its attributes
 by using `Job.fetch()`.
@@ -99,7 +131,11 @@ print('Status: %s' % job.get_status())
 ```
 
 Some interesting job attributes include:
-* `job.get_status()` Possible values are `queued`, `started`, `deferred`, `finished`, `stopped`, `scheduled` and `failed`
+* `job.get_status(refresh=True)` Possible values are `queued`, `started`,
+  `deferred`, `finished`, `stopped`, `scheduled`, `canceled` and `failed`. If `refresh` is
+  `True` fresh values are fetched from Redis.
+* `job.get_meta(refresh=True)` Returns custom `job.meta` dict containing user
+  stored data. If `refresh` is `True` fresh values are fetched from Redis.
 * `job.origin` queue name of this job
 * `job.func_name`
 * `job.args` arguments passed to the underlying job function
@@ -121,10 +157,38 @@ for job in jobs:
     print('Job %s: %s' % (job.id, job.func_name))
 ```
 
-## Stopping a Currently Executing Job
-_New in version 1.7.0._
 
-You can use `send_stop_job_command()` to tell a worker to immediately stop a currently executing job. A job that's stopped will be sent to [FailedJobRegistry](https://python-rq.org/docs/results/#dealing-with-exceptions).
+## Job Executions
+
+_New in 2.0_
+
+When a job is being executed, RQ stores it's execution data in Redis. You can access this data
+via `Execution` objects.
+
+```python
+from redis import Redis
+from rq.job import Job
+
+redis = Redis()
+job = Job.fetch('my_job_id', connection=redis)
+executions = job.get_executions()  # Returns all current executions
+execution = job.get_executions()[0]  # Retrieves a single execution
+print(execution.created_at)  # When did this execution start?
+print(execution.last_heartbeat)  # Worker's last heartbeat
+```
+
+`Execution` objects have a few properties:
+* `id`: ID of an execution.
+* `job`: the `Job` object that owns this execution instance
+* `composite_key`: a combination of `job.id` and `execution.id`, formatted as `<job_id>:<execution_id>`
+* `created_at`: returns a datetime object representing the start of this execution
+* `last_heartbeat`: worker's last heartbeat
+
+
+## Stopping a Currently Executing Job
+_New in version 1.7.0_
+
+You can use `send_stop_job_command()` to tell a worker to immediately stop a currently executing job. A job that's stopped will be sent to [FailedJobRegistry](/docs/results/#dealing-with-exceptions).
 
 ```python
 from redis import Redis
@@ -138,19 +202,69 @@ send_stop_job_command(redis, job_id)
 
 Unlike failed jobs, stopped jobs will *not* be automatically retried if retry is configured. Subclasses of `Worker` which override `handle_job_failure()` should likewise take care to handle jobs with a `stopped` status appropriately.
 
+## Canceling a Job
+_New in version 1.10.0_
+
+To prevent a job from running, cancel a job, use `job.cancel()`.
+
+```python
+from redis import Redis
+from rq.job import Job
+from rq.registry import CanceledJobRegistry
+from .queue import Queue
+
+redis = Redis()
+job = Job.fetch('my_job_id', connection=redis)
+job.cancel()
+
+job.get_status()  # Job status is CANCELED
+
+registry = CanceledJobRegistry(job.origin, connection=job.connection)
+print(job in registry)  # Job is in CanceledJobRegistry
+```
+
+Canceling a job will remove:
+1. Sets job status to `CANCELED`
+2. Removes job from queue
+3. Puts job into `CanceledJobRegistry`
+
+Note that `job.cancel()` does **not** delete the job itself from Redis. If you want to
+delete the job from Redis and reclaim memory, use `job.delete()`.
+
+Note: if you want to enqueue the dependents of the job you
+are trying to cancel use the following:
+
+```python
+from rq import cancel_job
+cancel_job(
+  '2eafc1e6-48c2-464b-a0ff-88fd199d039c',
+  enqueue_dependents=True
+)
+```
+
 ## Job / Queue Creation with Custom Serializer
 
-When creating a job or queue, you can pass in a custom serializer that will be used for serializing / de-serializing job arguments.
-Serializers used should have at least `loads` and `dumps` method.
-The default serializer used is `pickle`.
+When creating a job or queue, you can pass in a custom serializer that will be used for serializing / de-serializing job arguments. Serializers must implement `loads` and `dumps`. The default serializer is `pickle`.
+
+> **Warning:** RQ uses [`pickle`](https://docs.python.org/3/library/pickle.html#module-pickle) as its default serializer, which **is not secure**. Only run RQ against Redis instances that you trust. It is possible to construct malicious pickle data that will execute arbitrary code during unpickling.
+
+To avoid pickle, use an alternative serializer, such as `JSONSerializer`, when enqueueing and processing jobs. JSON only supports primitive argument types (str, int, float, bool, list, dict, None).
+
+For example, to enqueue jobs with the JSON serializer, pass either the `'json'` shorthand or the `JSONSerializer` class itself:
 
 ```python
 from rq import Queue
-from rq.job import Job
 from rq.serializers import JSONSerializer
 
-job = Job(connection=connection, serializer=JSONSerializer)
-queue = Queue(connection=connection, serializer=JSONSerializer)
+queue = Queue(connection=connection, serializer='json')  # or: serializer=JSONSerializer
+job = queue.enqueue('my_module.count_words', 'https://example.com')
+```
+
+Then run workers with the same serializer. The `--serializer` option accepts the shorthands `json` and `pickle`, or a full dotted path such as `rq.serializers.JSONSerializer`:
+
+```console
+$ rq worker --serializer json
+$ rq worker --serializer rq.serializers.JSONSerializer
 ```
 
 ## Accessing The "current" Job from within the job function
@@ -215,7 +329,7 @@ job = q.enqueue(count_words_at_url,
 
 ## Job Position in Queue
 
-For user feedback or debuging it is possible to get the position of a job
+For user feedback or debugging it is possible to get the position of a job
 within the work queue. This allows to track the job processing through the
 queue.
 
@@ -275,7 +389,7 @@ job = queue.enqueue(foo_job, failure_ttl=300)  # 5 minutes in seconds
 ```
 
 
-### Requeueing Failed Jobs
+### Requeuing Failed Jobs
 
 If you need to manually requeue failed jobs, here's how to do it:
 
@@ -295,12 +409,12 @@ assert len(registry) == 0  # Registry will be empty when job is requeued
 ```
 
 Starting from version 1.5.0, RQ also allows you to [automatically retry
-failed jobs](https://python-rq.org/docs/exceptions/#retrying-failed-jobs).
+failed jobs](/docs/exceptions/#retrying-failed-jobs).
 
 
-### Requeueing Failed Jobs via CLI
+### Requeuing Failed Jobs via CLI
 
-RQ also provides a CLI tool that makes requeueing failed jobs easy.
+RQ also provides a CLI tool that makes requeuing failed jobs easy.
 
 ```console
 # This will requeue foo_job_id and bar_job_id from myqueue's failed job registry

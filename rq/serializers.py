@@ -1,17 +1,30 @@
-from functools import partial
-import pickle
-import json
+from __future__ import annotations
 
-from .compat import string_types
+import json
+import pickle
+from collections.abc import Callable
+from functools import partial
+from typing import Any, ClassVar, Protocol, cast, runtime_checkable
+
 from .utils import import_attribute
 
 
+@runtime_checkable
+class Serializer(Protocol):
+    def dumps(self, obj: Any, /) -> bytes: ...  # pragma: no cover
+
+    def loads(self, data: bytes, /) -> Any: ...  # pragma: no cover
+
+
 class DefaultSerializer:
-    dumps = partial(pickle.dumps, protocol=pickle.HIGHEST_PROTOCOL)
-    loads = pickle.loads
+    dumps: ClassVar[Callable[[Any], bytes]] = partial(pickle.dumps, protocol=pickle.HIGHEST_PROTOCOL)
+    loads: ClassVar[Callable[[bytes], Any]] = pickle.loads
 
 
-class JSONSerializer():
+PickleSerializer = DefaultSerializer
+
+
+class JSONSerializer:
     @staticmethod
     def dumps(*args, **kwargs):
         return json.dumps(*args, **kwargs).encode('utf-8')
@@ -21,22 +34,34 @@ class JSONSerializer():
         return json.loads(s.decode('utf-8'), *args, **kwargs)
 
 
-def resolve_serializer(serializer):
+SERIALIZER_ALIASES: dict[str, Serializer] = {
+    'json': JSONSerializer,
+    'pickle': PickleSerializer,
+}
+
+
+def resolve_serializer(serializer: Serializer | str | None = None) -> Serializer:
     """This function checks the user defined serializer for ('dumps', 'loads') methods
     It returns a default pickle serializer if not found else it returns a MySerializer
     The returned serializer objects implement ('dumps', 'loads') methods
-    Also accepts a string path to serializer that will be loaded as the serializer
+    Also accepts a string path to serializer that will be loaded as the serializer.
+
+    Args:
+        serializer (Callable): The serializer to resolve.
+
+    Returns:
+        serializer (Callable): An object that implements the SerializerProtocol
     """
     if not serializer:
-        return DefaultSerializer
+        return PickleSerializer
 
-    if isinstance(serializer, string_types):
-        serializer = import_attribute(serializer)
+    if isinstance(serializer, str):
+        serializer_path = serializer
+        serializer = SERIALIZER_ALIASES.get(serializer_path)
+        if not serializer:
+            serializer = cast(Serializer, import_attribute(serializer_path))
 
-    default_serializer_methods = ('dumps', 'loads')
-
-    for instance_method in default_serializer_methods:
-        if not hasattr(serializer, instance_method):
-            raise NotImplementedError('Serializer should have (dumps, loads) methods.')
+    if not isinstance(serializer, Serializer):
+        raise NotImplementedError('Serializer should have (dumps, loads) methods.')
 
     return serializer
